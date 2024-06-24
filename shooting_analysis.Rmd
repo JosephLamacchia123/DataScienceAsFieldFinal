@@ -1,0 +1,152 @@
+---
+title: "Peer-graded Assignment: NYPD Shooting Incident Data Report"
+author: "Joe La Macchia"
+date: "2024-05-27"
+output: html_document
+---
+Importing libraries
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(randomForest)
+library(kknn)
+library(mltools)
+library(data.table)
+library(grid)
+library(cluster)
+library(factoextra)
+```
+
+The following dataset breaks down all NYC shootings since 2006, including information like the race/age of the shooter and victum as well as geographic information.  I will attempt to investigate the locations and times that tend to have the most shootings.
+```{r import data, include=TRUE}
+data_url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+shooting_data <- read_csv(data_url)
+```
+
+
+Here, I removed some unneeded features, hanlded NA values, and converted all categorical variables to factors.  I also split the hour of day into buckets of 4 hours. 
+```{r cleaning data, include=TRUE}
+shooting_data <- shooting_data %>% 
+  select(-c(INCIDENT_KEY,  Lon_Lat, LOC_OF_OCCUR_DESC, LOCATION_DESC, LOC_CLASSFCTN_DESC, PRECINCT)) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+  mutate(
+    PERP_SEX = ifelse(is.na(PERP_SEX) | PERP_SEX == '(null)', 'U', PERP_SEX),
+    PERP_RACE = ifelse(is.na(PERP_RACE) | PERP_RACE == '(null)', 'UNKNOWN', PERP_RACE),
+    PERP_AGE_GROUP = ifelse(is.na(PERP_AGE_GROUP) | PERP_AGE_GROUP == '(null)', 'UNKNOWN', PERP_AGE_GROUP),
+    VIC_SEX = ifelse(is.na(VIC_SEX) | VIC_SEX == '(null)', 'U', VIC_SEX),
+    VIC_RACE = ifelse(is.na(VIC_RACE) | VIC_RACE == '(null)', 'UNKNOWN', VIC_RACE),
+    VIC_AGE_GROUP = ifelse(is.na(VIC_AGE_GROUP) | VIC_AGE_GROUP == '(null)', 'UNKNOWN', VIC_AGE_GROUP)
+    ) %>%
+    mutate(
+    OCCUR_TIME = hour(OCCUR_TIME),
+    
+    TIME_RANGE = case_when(
+    OCCUR_TIME >= 0 & OCCUR_TIME < 4 ~ "early_morning (12:00am - 4:00am)",
+    OCCUR_TIME >= 4 & OCCUR_TIME < 8 ~ "morning (4:00am - 8:00am)",
+    OCCUR_TIME >= 8 & OCCUR_TIME < 12 ~ "late_morning (8:00am - 12:00pm)",
+    OCCUR_TIME >= 12 & OCCUR_TIME < 16 ~ "afternoon (12:00pm - 4:00pm)",
+    OCCUR_TIME >= 16 & OCCUR_TIME < 20 ~ "evening (4:00pm - 8:00pm)",
+    OCCUR_TIME >= 20 & OCCUR_TIME < 24 ~ "night (8:00pm - 12:00am)"
+  )) %>%
+  mutate(
+    BORO = as.factor(BORO),
+    STATISTICAL_MURDER_FLAG = as.factor(STATISTICAL_MURDER_FLAG),
+    PERP_SEX = as.factor(PERP_SEX),
+    PERP_RACE = as.factor(PERP_RACE),
+    PERP_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+    VIC_SEX = as.factor(PERP_SEX),
+    VIC_RACE = as.factor(PERP_RACE),
+    JURISDICTION_CODE = as.factor(JURISDICTION_CODE),
+    VIC_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+    TIME_RANGE = as.factor(TIME_RANGE)
+    ) %>%
+  na.omit(shooting_data[, c("Longitude", "Latitude")])
+
+shooting_data$TIME_RANGE <- factor(shooting_data$TIME_RANGE, levels = c("early_morning (12:00am - 4:00am)", "morning (4:00am - 8:00am)", "late_morning (8:00am - 12:00pm)", "afternoon (12:00pm - 4:00pm)", "evening (4:00pm - 8:00pm)", "night (8:00pm - 12:00am)"))
+```
+
+
+From shootings_time_plot below, it is clear that a majority of shootings occur durring late night and early morning hours.
+
+
+It can be seen from shootings_boro_plot that the Bronx and Brooklyn account for the majority of shootings in NY while Staten Island has a minimal number of shootings by comparison.
+```{r visualizations, include=TRUE}
+
+shootings_by_time_range <- shooting_data %>%
+  group_by(TIME_RANGE) %>%
+  summarise(INCIDENT_COUNT = n())
+
+shootings_by_boro <- shooting_data %>%
+  group_by(BORO) %>%
+  summarise(INCIDENT_COUNT = n())
+
+shootings_time_plot <- ggplot(shootings_by_time_range, aes(x = TIME_RANGE, y = INCIDENT_COUNT)) +
+    geom_bar(stat = "identity", fill = "steelblue") + 
+    labs(title = "Shootings By Time of Day", x = "Time of Day", y = "Number of Shootings") +
+    theme_minimal() + 
+    theme(
+        plot.title = element_text(size = 22, face = "bold", hjust = 0.5),
+        axis.title.x = element_text(size = 14),
+        axis.title.y = element_text(size = 14),
+        axis.text.x = element_text(size = 12, angle = 30, hjust = 1, vjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.grid.major = element_line(size = 0.5, linetype = 'solid', colour = "grey80"),
+        panel.grid.minor = element_line(size = 0.25, linetype = 'solid', colour = "grey90"),
+        plot.margin = unit(c(1, 1, 1, 1), "cm")
+    )
+shootings_time_plot
+
+shootings_boro_plot <- ggplot(shootings_by_boro, aes(x = BORO, y = INCIDENT_COUNT)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    labs(title = "Shootings By Boro", x = "Boro", y = "Number of Shootings") +
+    theme_minimal() 
+shootings_boro_plot
+```   
+
+
+
+Below is a K-Means clustering of shootings by x,y coordinates and Time Zone.  It can be observed that there are centers of activity that radiate outward.  These could be particular blocks or neighborhoods in which violent crime is common.
+```{r modeling, include=TRUE}
+
+
+
+data_for_clustering <- shooting_data %>%
+    select(X_COORD_CD, Y_COORD_CD, TIME_RANGE) %>%
+    mutate(TIME_RANGE = as.factor(TIME_RANGE))
+
+time_range_dummies <- model.matrix(~TIME_RANGE - 1, data = data_for_clustering)
+
+
+data_for_clustering <- cbind(data_for_clustering %>% select(X_COORD_CD, Y_COORD_CD), time_range_dummies)
+
+
+
+
+set.seed(123) # Set seed for reproducibility
+num_clusters <- 4 
+
+kmeans_result <- kmeans(data_for_clustering, centers = num_clusters, nstart = 25)
+
+data_for_clustering$cluster <- as.factor(kmeans_result$cluster)
+
+ggplot(data_for_clustering, aes(x = X_COORD_CD, y = Y_COORD_CD, color = cluster)) +
+    geom_point(alpha = 0.6, size = 2.5) +
+    labs(title = "K-Means Clustering of Shooting Incidents",
+         x = "X Coordinate",
+         y = "Y Coordinate") +
+    theme_minimal() +
+    scale_color_manual(values = rainbow(num_clusters))
+```
+
+
+Conclusion: 
+
+It is clear from the above analysis that certain areas during certain times of day tend to have more shootings.  It makes intuitive sense that less shootings occur during the daylight hours and more under cover of darkness so those results are expected.  There is potential for bias in how different jurisdictions record shooting data.  For example it could be that a jurisdiction moves over boro lines.  In this instance the boro recorded may be where the shooting occurred or where the report is made.  It is also not clear whether or not the geographic data points to the exact location or to a nearby landmark or house in which geographic data like longitude and latitude can be gathered easily via a mapping application.  If this is the case then the clustering of shooting locations may be biased.
+
+
+
+
+
